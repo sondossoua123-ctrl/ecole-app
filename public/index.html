@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>École Primaire</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<section id="login">
+  <form id="lf">
+    <h1>École Primaire</h1>
+    <p>Connectez-vous à votre espace</p>
+    <input id="em" type="email" placeholder="Email" required>
+    <input id="pw" type="password" placeholder="Mot de passe" required>
+    <button>Se connecter</button>
+    <p id="le" class="err"></p>
+  </form>
+</section>
+<section id="app" hidden>
+  <header><b>École Primaire</b><span id="who"></span><button id="lo">Déconnexion</button></header>
+  <div class="wrap"><nav id="nav"></nav><main id="main"></main></div>
+</section>
+<dialog id="dlg"><form id="df"></form></dialog>
+<script src="app.js"></script>
+</body>
+</html>
