@@ -6,11 +6,13 @@ async function api(p, m = 'GET', b) {
   const r = await fetch('/api/' + p, { method: m, headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token }, body: b ? JSON.stringify(b) : undefined });
   const t = await r.text(); let j; try { j = JSON.parse(t); } catch { j = t; }
   if (r.status === 401 && token) { logout(); throw new Error('Session expirée'); }
+  if (r.status === 403 && j && /suspendue/.test(j.error || '')) { logout(); throw new Error(j.error); }
   if (!r.ok) throw new Error(j.error || (typeof j === 'string' ? j : 'Erreur'));
   return j;
 }
 const ALL = ['admin', 'teacher', 'parent', 'student', 'accountant'];
-const ROLE_FR = { admin: 'Administrateur', teacher: 'Enseignant', parent: 'Parent', student: 'Élève', accountant: 'Comptable' };
+const ROLE_FR = { admin: 'Administrateur', teacher: 'Enseignant', parent: 'Parent', student: 'Élève', accountant: 'Comptable', superadmin: 'Super-administrateur' };
+const STATUS_FR = { trial: 'Essai', active: 'Actif', suspended: 'Suspendu' };
 const LBL = { users: o => o.name, classes: o => o.niveau + ' ' + (o.section || ''), subjects: o => o.nom, students: o => o.prenom + ' ' + o.nom };
 const COLL = { classe: 'classes', parent: 'users', user: 'users', titulaire: 'users', student: 'students', subject: 'subjects' };
 const ENT = {
@@ -23,13 +25,14 @@ const ENT = {
   homework: { t: 'Devoirs', w: ['admin', 'teacher'], cols: ['titre', 'classe', 'subject', 'dateRemise'], f: [['titre', 'Titre'], ['description', 'Description', 'textarea'], ['classe', 'Classe', 'ref:classes'], ['subject', 'Matière', 'ref:subjects'], ['dateRemise', 'Date de remise', 'date']] }
 };
 const MENU = {
+  superadmin: ['schools'],
   admin: ['users', 'classes', 'subjects', 'students', 'grades', 'payments', 'homework', 'messages', 'announce'],
   teacher: ['students', 'grades', 'homework', 'classes', 'subjects', 'messages'],
   parent: ['students', 'grades', 'payments', 'homework', 'messages'],
   student: ['grades', 'homework', 'messages'],
   accountant: ['students', 'payments', 'messages']
 };
-const NAMES = { messages: 'Messagerie', announce: 'Annonces' };
+const NAMES = { messages: 'Messagerie', announce: 'Annonces', schools: 'Écoles' };
 const title = k => NAMES[k] || ENT[k].t;
 
 /* ----- Connexion ----- */
@@ -45,11 +48,28 @@ $('#lo').onclick = logout;
 function start() {
   if (!token || !me) return logout();
   $('#login').hidden = true; $('#app').hidden = false;
-  $('#who').textContent = me.name + ' (' + ROLE_FR[me.role] + ')';
+  $('#who').textContent = me.name + ' (' + ROLE_FR[me.role] + ')' + (me.school ? ' – ' + me.school : '');
+  if (!$('#chpw')) { const b = document.createElement('button'); b.id = 'chpw'; b.type = 'button'; b.className = 'sec'; b.textContent = 'Mon mot de passe'; b.onclick = pwForm; $('#lo').before(b); }
   $('#nav').innerHTML = MENU[me.role].map(k => `<button data-nav="${k}">${title(k)}</button>`).join('');
   show(MENU[me.role][0]);
 }
 $('#nav').onclick = e => { const k = e.target.dataset.nav; if (k) show(k); };
+
+/* ----- Changer mon mot de passe ----- */
+function pwForm() {
+  $('#df').innerHTML = `<h3>Changer mon mot de passe</h3>
+  <label>Mot de passe actuel<input type="password" name="current" required autocomplete="current-password"></label>
+  <label>Nouveau mot de passe (6 caractères minimum)<input type="password" name="password" required minlength="6" autocomplete="new-password"></label>
+  <label>Confirmer le nouveau mot de passe<input type="password" name="confirm" required autocomplete="new-password"></label>
+  <p class="err" id="fe"></p><div class="row"><button type="button" class="sec" id="cx">Annuler</button><button>Enregistrer</button></div>`;
+  $('#dlg').showModal(); $('#cx').onclick = () => $('#dlg').close();
+  $('#df').onsubmit = async e => {
+    e.preventDefault(); const b = {}; new FormData($('#df')).forEach((v, n) => { b[n] = v; });
+    if (b.password !== b.confirm) { $('#fe').textContent = 'Les deux mots de passe ne correspondent pas'; return; }
+    try { await api('me/password', 'PUT', { current: b.current, password: b.password }); $('#dlg').close(); alert('Mot de passe modifié.'); }
+    catch (err) { $('#fe').textContent = err.message; }
+  };
+}
 
 /* ----- Tableaux CRUD ----- */
 function cell(k, v) {
@@ -64,6 +84,7 @@ async function show(k) {
   try {
     if (k === 'messages') return msgs('in');
     if (k === 'announce') return announce();
+    if (k === 'schools') return schoolsPage();
     const E = ENT[k], data = await api(k), w = E.w.includes(me.role);
     rows[k] = data;
     const head = E.cols.map(c => `<th>${esc(E.f.find(f => f[0] === c)?.[1] || c)}</th>`).join('');
@@ -88,6 +109,11 @@ $('#main').onclick = async e => {
   if (a === 'del' && confirm('Supprimer cet enregistrement ?')) { try { await api(k + '/' + id, 'DELETE'); show(k); } catch (err) { alert(err.message); } }
   if (a === 'box') return msgs(id);
   if (a === 'hide') { await api('messages/' + id + '/hide', 'PUT'); msgs('in'); }
+  // super-administrateur : écoles
+  if (a === 'sadd') return schoolForm();
+  if (a === 'sedit') return schoolForm(rows.schools.find(r => r._id === id));
+  if (a === 'spw') { const pw = prompt('Nouveau mot de passe du directeur (6 caractères minimum) :'); if (pw) { try { await api('schools/' + id + '/admin-password', 'PUT', { password: pw }); alert('Mot de passe modifié.'); } catch (err) { alert(err.message); } } }
+  if (a === 'sdel' && confirm('Supprimer cette école ? Ses utilisateurs ne pourront plus se connecter.')) { try { await api('schools/' + id, 'DELETE'); schoolsPage(); } catch (err) { alert(err.message); } }
 };
 
 /* ----- Formulaire ajout / modification ----- */
@@ -140,6 +166,29 @@ function announce() {
   $('#af').onsubmit = async e => {
     e.preventDefault(); const f = new FormData($('#af'));
     try { const r = await api('announce', 'POST', { roles: f.getAll('roles'), objet: f.get('objet'), corps: f.get('corps') }); $('#fe').style.color = 'green'; $('#fe').textContent = 'Annonce envoyée à ' + r.envoyes + ' utilisateur(s).'; $('#af').reset(); }
+    catch (err) { $('#fe').textContent = err.message; }
+  };
+}
+
+/* ----- Écoles (super-administrateur) ----- */
+async function schoolsPage() {
+  const list = await api('schools'); rows.schools = list;
+  $('#main').innerHTML = `<h2>Écoles</h2><button data-a="sadd">Ajouter une école</button>
+  <div class="scroll"><table><tr><th>École</th><th>Statut</th><th>Formule</th><th>Fin d’abonnement</th><th>Utilisateurs</th><th>Élèves</th><th></th></tr>
+  ${list.map(s => `<tr><td>${esc(s.name)}</td><td>${STATUS_FR[s.status] || esc(s.status)}</td><td>${esc(s.plan)}</td><td>${s.subscriptionEnd ? new Date(s.subscriptionEnd).toLocaleDateString('fr-FR') : '—'}</td><td>${s.users}</td><td>${s.students}</td>
+  <td class="act"><button class="sec" data-a="sedit" data-id="${s._id}">Modifier</button><button class="sec" data-a="spw" data-id="${s._id}">Mot de passe directeur</button><button class="del" data-a="sdel" data-id="${s._id}">Supprimer</button></td></tr>`).join('') || '<tr><td colspan="7">Aucune école.</td></tr>'}</table></div>`;
+}
+function schoolForm(row) {
+  const f = (n, l, ty = 'text', v = '', req = '') => `<label>${l}<input type="${ty}" name="${n}" value="${esc(v)}" ${req}></label>`;
+  let h = `<h3>${row ? 'Modifier' : 'Ajouter'} une école</h3>` + f('name', 'Nom de l’école', 'text', row?.name, 'required');
+  h += `<label>Statut<select name="status">${['trial', 'active', 'suspended'].map(s => `<option value="${s}" ${(row?.status || 'active') === s ? 'selected' : ''}>${STATUS_FR[s]}</option>`).join('')}</select></label>`;
+  h += f('plan', 'Formule', 'text', row?.plan || 'basic') + f('subscriptionEnd', 'Fin d’abonnement', 'date', row?.subscriptionEnd ? String(row.subscriptionEnd).slice(0, 10) : '');
+  if (!row) h += '<h4>Compte du directeur</h4>' + f('adminName', 'Nom du directeur', 'text', '', 'required') + f('adminEmail', 'Email du directeur', 'email', '', 'required') + f('adminPassword', 'Mot de passe', 'password', '', 'required');
+  h += `<p class="err" id="fe"></p><div class="row"><button type="button" class="sec" id="cx">Annuler</button><button>Enregistrer</button></div>`;
+  $('#df').innerHTML = h; $('#dlg').showModal(); $('#cx').onclick = () => $('#dlg').close();
+  $('#df').onsubmit = async e => {
+    e.preventDefault(); const b = {}; new FormData($('#df')).forEach((v, n) => { b[n] = v; });
+    try { await api(row ? 'schools/' + row._id : 'schools', row ? 'PUT' : 'POST', b); $('#dlg').close(); schoolsPage(); }
     catch (err) { $('#fe').textContent = err.message; }
   };
 }
