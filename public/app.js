@@ -16,7 +16,7 @@ const STATUS_FR = { trial: 'Essai', active: 'Actif', suspended: 'Suspendu' };
 const LBL = { users: o => o.name, classes: o => o.niveau + ' ' + (o.section || ''), subjects: o => o.nom, students: o => o.prenom + ' ' + o.nom };
 const COLL = { classe: 'classes', parent: 'users', user: 'users', titulaire: 'users', student: 'students', subject: 'subjects' };
 const ENT = {
-  users: { t: 'Utilisateurs', w: ['admin'], cols: ['name', 'email', 'role'], f: [['name', 'Nom complet'], ['email', 'Email', 'email'], ['role', 'Rôle', 'sel:admin,teacher,parent,student,accountant'], ['password', 'Mot de passe (vide = inchangé)', 'password']] },
+  users: { t: 'Utilisateurs', w: ['admin'], cols: ['name', 'email', 'role'], f: [['name', 'Nom complet'], ['email', 'Email', 'email'], ['role', 'Rôle', 'sel:admin,teacher,accountant'], ['password', 'Mot de passe (vide = inchangé)', 'password']] },
   classes: { t: 'Classes', w: ['admin'], cols: ['niveau', 'section', 'capacite', 'titulaire', 'annee_scolaire'], f: [['niveau', 'Niveau (CP, CE1…)'], ['section', 'Section'], ['capacite', 'Capacité maximale', 'number'], ['titulaire', 'Enseignant titulaire', 'ref:users:teacher'], ['annee_scolaire', 'Année scolaire']] },
   subjects: { t: 'Matières', w: ['admin'], cols: ['nom', 'coefficient', 'niveau'], f: [['nom', 'Nom'], ['coefficient', 'Coefficient', 'number'], ['niveau', 'Niveau concerné']] },
   students: { t: 'Élèves', w: ['admin'], cols: ['prenom', 'nom', 'classe', 'parent', 'scolarite'], f: [['nom', 'Nom'], ['prenom', 'Prénom'], ['dateNaissance', 'Date de naissance', 'date'], ['classe', 'Classe', 'ref:classes'], ['parent', 'Parent / tuteur', 'ref:users:parent'], ['user', 'Compte élève', 'ref:users:student'], ['scolarite', 'Scolarité due (DT)', 'number'], ['medical', 'Antécédents médicaux', 'textarea'], ['annee_scolaire', 'Année scolaire']] },
@@ -92,7 +92,7 @@ async function show(k) {
       ${k === 'students' && me.role !== 'accountant' ? `<button class="sec" data-a="bul" data-id="${r._id}">Bulletin</button>` : ''}
       ${k === 'payments' ? `<button class="sec" data-a="rec" data-id="${r._id}">Reçu</button>` : ''}
       ${w ? `<button class="sec" data-a="edit" data-k="${k}" data-id="${r._id}">Modifier</button><button class="del" data-a="del" data-k="${k}" data-id="${r._id}">Supprimer</button>` : ''}</td></tr>`).join('');
-    $('#main').innerHTML = `<h2>${E.t}</h2>${w ? `<button data-a="add" data-k="${k}">Ajouter</button>` : ''}
+    $('#main').innerHTML = `<h2>${E.t}</h2>${k === 'users' ? '<p>Les comptes <b>parent</b> et <b>élève</b> se créent depuis la fiche de l’élève (menu Élèves, bouton Ajouter).</p>' : ''}${w ? `<button data-a="add" data-k="${k}">Ajouter</button>` : ''}
       <div class="scroll"><table><tr>${head}<th></th></tr>${body || `<tr><td colspan="${E.cols.length + 1}">Aucun enregistrement.</td></tr>`}</table></div>`;
   } catch (err) { $('#main').innerHTML = `<p class="err">${esc(err.message)}</p>`; }
 }
@@ -116,26 +116,63 @@ $('#main').onclick = async e => {
   if (a === 'sdel' && confirm('Supprimer cette école ? Ses utilisateurs ne pourront plus se connecter.')) { try { await api('schools/' + id, 'DELETE'); schoolsPage(); } catch (err) { alert(err.message); } }
 };
 
+/* ----- Bloc parent du formulaire élève (le parent est obligatoire) ----- */
+const FS = 'border:1px solid var(--line);border-radius:12px;padding:14px;display:grid;gap:12px;margin:0';
+async function parentBlock(row) {
+  const parents = (await api('users')).filter(x => x.role === 'parent');
+  const cur = row?.parent?._id || row?.parent || '';
+  const opts = '<option value="">—</option>' + parents.map(p => `<option value="${p._id}" ${p._id === cur ? 'selected' : ''}>${esc(p.name)} (${esc(p.email)})</option>`).join('');
+  const lg = '<legend style="font-weight:700;padding:0 6px">Parent / tuteur (obligatoire)</legend>';
+  if (row) return `<fieldset style="${FS}">${lg}<label>Parent<select name="parent" required>${opts}</select></label></fieldset>`;
+  return `<fieldset style="${FS}">${lg}
+    <div class="checks"><label><input type="radio" name="pmode" value="new" checked>Nouveau parent</label>
+    <label><input type="radio" name="pmode" value="existing" ${parents.length ? '' : 'disabled'}>Parent existant (frère ou sœur déjà inscrit)</label></div>
+    <div id="pnew" style="display:grid;gap:12px"><label>Nom complet du parent<input name="np_name"></label>
+    <label>Email du parent<input type="email" name="np_email"></label>
+    <label>Mot de passe du parent (6 caractères min.)<input type="password" name="np_password" minlength="6"></label></div>
+    <div id="pold" style="display:none"><label>Parent<select name="parent">${opts}</select></label></div></fieldset>`;
+}
+function syncParent() {
+  const m = document.querySelector('input[name=pmode]:checked'); if (!m) return;
+  const isNew = m.value === 'new';
+  $('#pnew').style.display = isNew ? 'grid' : 'none'; $('#pold').style.display = isNew ? 'none' : 'grid';
+  ['np_name', 'np_email', 'np_password'].forEach(n => { const el = document.querySelector(`[name=${n}]`); el.required = isNew; el.disabled = !isNew; });
+  const sel = document.querySelector('#pold select'); sel.required = !isNew; sel.disabled = isNew;
+}
+
 /* ----- Formulaire ajout / modification ----- */
 async function form(k, row) {
   const E = ENT[k]; let h = `<h3>${row ? 'Modifier' : 'Ajouter'} – ${E.t}</h3>`;
   for (const [n, l, ty = 'text'] of E.f) {
     let v = row?.[n]; if (v && typeof v === 'object') v = v._id;
+    if (k === 'students' && n === 'parent') { h += await parentBlock(row); continue; }
+    if (k === 'students' && n === 'user' && !row) {
+      h += `<fieldset style="${FS}"><legend style="font-weight:700;padding:0 6px">Compte de connexion de l’élève (facultatif)</legend><label>Email de l’élève<input type="email" name="nu_email"></label><label>Mot de passe (6 caractères min.)<input type="password" name="nu_password" minlength="6"></label></fieldset>`;
+      continue;
+    }
     if (ty.startsWith('ref:')) {
       const [, c, role] = ty.split(':'); const list = (await api(c)).filter(x => !role || x.role === role);
       h += `<label>${l}<select name="${n}"><option value="">—</option>${list.map(x => `<option value="${x._id}" ${x._id === v ? 'selected' : ''}>${esc(LBL[c](x))}</option>`).join('')}</select></label>`;
     } else if (ty.startsWith('sel:')) {
-      h += `<label>${l}<select name="${n}">${ty.slice(4).split(',').map(o => `<option ${String(v) === o ? 'selected' : ''} value="${o}">${ROLE_FR[o] || o}</option>`).join('')}</select></label>`;
+      let opts = ty.slice(4).split(','), dis = '';
+      if (k === 'users' && n === 'role' && row && ['parent', 'student'].includes(row.role)) { opts = [row.role]; dis = 'disabled'; }
+      h += `<label>${l}<select name="${n}" ${dis}>${opts.map(o => `<option ${String(v) === o ? 'selected' : ''} value="${o}">${ROLE_FR[o] || o}</option>`).join('')}</select></label>`;
     } else if (ty === 'textarea') h += `<label>${l}<textarea name="${n}" rows="3">${esc(v)}</textarea></label>`;
     else if (ty === 'date') h += `<label>${l}<input type="date" name="${n}" value="${v ? String(v).slice(0, 10) : ''}"></label>`;
     else h += `<label>${l}<input type="${ty}" name="${n}" ${ty === 'number' ? 'step="any"' : ''} value="${ty === 'password' ? '' : esc(v)}"></label>`;
   }
   h += `<p class="err" id="fe"></p><div class="row"><button type="button" class="sec" id="cx">Annuler</button><button>Enregistrer</button></div>`;
   $('#df').innerHTML = h; $('#dlg').showModal();
+  if (k === 'students' && !row) { document.querySelectorAll('input[name=pmode]').forEach(r => { r.onchange = syncParent; }); syncParent(); }
   $('#cx').onclick = () => $('#dlg').close();
   $('#df').onsubmit = async e => {
     e.preventDefault();
     const body = {}; new FormData($('#df')).forEach((v, n) => { body[n] = v; });
+    if (k === 'students' && !row) {
+      if (body.np_name !== undefined) body.newParent = { name: body.np_name, email: body.np_email, password: body.np_password };
+      if (body.nu_email) body.newUser = { email: body.nu_email, password: body.nu_password };
+      ['np_name', 'np_email', 'np_password', 'pmode', 'nu_email', 'nu_password'].forEach(x => delete body[x]);
+    }
     try { await api(row ? k + '/' + row._id : k, row ? 'PUT' : 'POST', body); $('#dlg').close(); show(k); }
     catch (err) { $('#fe').textContent = err.message; }
   };

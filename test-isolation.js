@@ -24,15 +24,19 @@ async function setup(sa, L) {
   let r = await call(sa, 'POST', 'schools', { name: `Ecole ${L} ${stamp}`, adminName: `Directeur ${L}`, adminEmail, adminPassword: 'Test1234' });
   if (r.status !== 200) throw new Error('Création école ' + L + ' : ' + JSON.stringify(r.data));
   const schoolId = r.data.id, admin = await login(adminEmail, 'Test1234');
-  await call(admin, 'POST', 'users', { name: `Parent ${L}`, email: parentEmail, role: 'parent', password: 'Test1234' });
   await call(admin, 'POST', 'users', { name: `Prof ${L}`, email: `prof-${l}-${stamp}@test.tn`, role: 'teacher', password: 'Test1234' });
-  const users = (await call(admin, 'GET', 'users')).data;
-  const parent = users.find(u => u.email === parentEmail), adminUser = users.find(u => u.email === adminEmail);
   await call(admin, 'POST', 'classes', { niveau: 'CE1', section: L, capacite: 25 });
   const cls = (await call(admin, 'GET', 'classes')).data[0];
   await call(admin, 'POST', 'subjects', { nom: 'Maths', coefficient: 2 });
   const subj = (await call(admin, 'GET', 'subjects')).data[0];
-  for (let i = 1; i <= 5; i++) await call(admin, 'POST', 'students', { nom: `${L}-Eleve${i}`, prenom: 'Test', classe: cls._id, parent: i === 1 ? parent._id : '', scolarite: 1000 });
+  // un parent est créé avec son élève : il n'existe pas de parent sans enfant inscrit
+  for (let i = 1; i <= 5; i++) {
+    const email = i === 1 ? parentEmail : `parent${i}-${l}-${stamp}@test.tn`;
+    r = await call(admin, 'POST', 'students', { nom: `${L}-Eleve${i}`, prenom: 'Test', classe: cls._id, scolarite: 1000, newParent: { name: `Parent ${L}${i}`, email, password: 'Test1234' } });
+    if (r.status !== 200) throw new Error('Création élève + parent (' + L + ') : ' + JSON.stringify(r.data));
+  }
+  const users = (await call(admin, 'GET', 'users')).data;
+  const parent = users.find(u => u.email === parentEmail), adminUser = users.find(u => u.email === adminEmail);
   const students = (await call(admin, 'GET', 'students')).data, s1 = students.find(s => s.nom === `${L}-Eleve1`);
   await call(admin, 'POST', 'grades', { student: s1._id, subject: subj._id, valeur: 15 });
   await call(admin, 'POST', 'payments', { student: s1._id, montant: 100, mode: 'Espèces' });
@@ -63,7 +67,7 @@ async function cross(X, Y) {
   const yc = (await call(Y.admin, 'GET', 'classes')).data;
   ok(t + 'envoyer un schoolId dans le formulaire n’a aucun effet', !yc.some(c => c.niveau === 'HACK-' + X.L));
   const contacts = (await call(X.admin, 'GET', 'contacts')).data;
-  ok(t + 'contacts de la messagerie : uniquement son école', Array.isArray(contacts) && !contacts.some(c => c.name === `Directeur ${Y.L}` || c.name === `Parent ${Y.L}`));
+  ok(t + 'contacts de la messagerie : uniquement son école', Array.isArray(contacts) && !contacts.some(c => c.name === `Directeur ${Y.L}` || c.name.startsWith(`Parent ${Y.L}`)));
   r = await call(X.admin, 'POST', 'messages', { to: Y.adminId, objet: 'a', corps: 'b' });
   ok(t + 'écrire à un utilisateur de l’autre école : refusé', r.status === 403);
   r = await call(X.admin, 'POST', 'announce', { objet: 'Annonce-test-' + X.L, corps: 'x' });
@@ -76,12 +80,62 @@ async function cross(X, Y) {
   ok(t + 'le parent ne peut pas ouvrir le bulletin de l’autre école', r.status !== 200);
 }
 
+
+async function coherence(X) {
+  console.log(`\nCohérence parent / élève (école ${X.L})`);
+  const t = Date.now();
+  let r = await call(X.admin, 'POST', 'users', { name: 'Parent direct', email: `direct-${t}@test.tn`, role: 'parent', password: 'Test1234' });
+  ok('créer un compte parent directement (menu Utilisateurs) : refusé', r.status === 400);
+  r = await call(X.admin, 'POST', 'users', { name: 'Eleve direct', email: `direct-eleve-${t}@test.tn`, role: 'student', password: 'Test1234' });
+  ok('créer un compte élève directement : refusé', r.status === 400);
+  r = await call(X.admin, 'POST', 'students', { nom: 'Sans', prenom: 'Parent', classe: X.cls._id });
+  ok('ajouter un élève sans parent : refusé', r.status === 400);
+  const em = `np-${t}@test.tn`;
+  r = await call(X.admin, 'POST', 'students', { nom: 'Nouveau', prenom: 'Eleve', classe: X.cls._id, newParent: { name: 'Parent Nouveau', email: em, password: 'Test1234' } });
+  ok('ajouter un élève avec un nouveau parent : accepté', r.status === 200);
+  const tok = await login(em, 'Test1234').catch(() => null);
+  ok('le nouveau parent peut se connecter', !!tok);
+  const kids = tok ? (await call(tok, 'GET', 'students')).data : [];
+  ok('le nouveau parent voit son enfant', Array.isArray(kids) && kids.length === 1 && kids[0].nom === 'Nouveau');
+  let users = (await call(X.admin, 'GET', 'users')).data;
+  const np = users.find(u => u.email === em);
+  r = await call(X.admin, 'DELETE', 'users/' + np._id);
+  ok('supprimer un parent qui a un élève : refusé', r.status === 409);
+  r = await call(X.admin, 'PUT', 'users/' + np._id, { role: 'teacher' });
+  ok('changer le rôle d’un parent : refusé', r.status === 400);
+  const prof = users.find(u => u.role === 'teacher');
+  r = await call(X.admin, 'POST', 'students', { nom: 'X', prenom: 'X', classe: X.cls._id, parent: prof._id });
+  ok('choisir un enseignant comme parent : refusé', r.status === 400);
+  const before = users.length;
+  r = await call(X.admin, 'POST', 'students', { nom: 'Dup', prenom: 'Dup', classe: X.cls._id, newParent: { name: 'Dup', email: em, password: 'Test1234' } });
+  ok('nouveau parent avec un email déjà utilisé : refusé', r.status === 400);
+  users = (await call(X.admin, 'GET', 'users')).data;
+  ok('aucun compte orphelin créé après un échec', users.length === before);
+  const se = `eleve-${t}@test.tn`;
+  r = await call(X.admin, 'POST', 'students', { nom: 'Avec', prenom: 'Compte', classe: X.cls._id, parent: X.parent._id, newUser: { email: se, password: 'Test1234' } });
+  ok('ajouter un élève avec son compte de connexion : accepté', r.status === 200);
+  const stok = await login(se, 'Test1234').catch(() => null);
+  ok('le compte élève peut se connecter', !!stok);
+  const list = (await call(X.admin, 'GET', 'students')).data;
+  r = await call(X.admin, 'DELETE', 'students/' + list.find(s => s.nom === 'Nouveau')._id);
+  ok('supprimer l’unique enfant d’un parent : accepté', r.status === 200);
+  r = await call(null, 'POST', 'login', { email: em, password: 'Test1234' });
+  ok('le parent sans enfant n’a plus de compte actif', r.status === 401);
+  r = await call(X.admin, 'DELETE', 'students/' + list.find(s => s.nom === 'Avec')._id);
+  ok('supprimer un élève qui a un compte de connexion : accepté', r.status === 200);
+  r = await call(null, 'POST', 'login', { email: se, password: 'Test1234' });
+  ok('le compte élève sans élève n’est plus actif', r.status === 401);
+  r = await call(null, 'POST', 'login', { email: X.parentEmail, password: 'Test1234' });
+  ok('un parent qui a encore un élève garde son compte', r.status === 200);
+}
+
 (async () => {
   const sa = await login(SA.email, SA.password);
   const A = await setup(sa, 'A'), B = await setup(sa, 'B');
   console.log('Écoles de test créées : A et B (5 élèves chacune)');
   await cross(A, B);
   await cross(B, A);
+  await coherence(A);
 
   console.log('\nSuper-administrateur et suspension');
   let r = await call(sa, 'GET', 'students');

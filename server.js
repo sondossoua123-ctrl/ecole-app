@@ -13,6 +13,8 @@ const { Schema } = mongoose;
 const oid = n => ({ type: Schema.Types.ObjectId, ref: n });
 const SCHOOL_ROLES = ['admin', 'teacher', 'parent', 'student', 'accountant'];
 const ROLES = [...SCHOOL_ROLES, 'superadmin'];
+// Un compte parent ou élève n'existe que s'il est lié à un élève inscrit : il se crée depuis la fiche de l'élève
+const LINKED = ['parent', 'student'];
 const anneeCourante = () => { const d = new Date(), y = d.getMonth() >= 8 ? d.getFullYear() : d.getFullYear() - 1; return y + '-' + (y + 1); };
 // Toute donnée métier appartient à une école : schoolId obligatoire et indexé
 const mk = (n, def, tenant = true) => mongoose.model(n, new Schema({
@@ -77,7 +79,10 @@ function crud(name, Model, c) {
   }));
   r.post('/', auth, only(...c.write), wrap(async (req, res) => {
     const b = clean(req.body, true); await validateRefs(c, b, req.user);
-    const d = await Model.create({ ...(await prep(b, true, req.user)), schoolId: req.user.schoolId });
+    const ctx = {}; let d;
+    const data = await prep(b, true, req.user, null, ctx);
+    try { d = await Model.create({ ...data, schoolId: req.user.schoolId }); }
+    catch (e) { if (ctx.rollback) await ctx.rollback(); throw e; }
     await logAudit(req.user, { action: 'create', entity: name, ref: d.id, apres: strip(d.toObject()) });
     if (c.after) await c.after(d, req.user);
     res.json({ ok: true });
@@ -86,8 +91,9 @@ function crud(name, Model, c) {
     const old = await Model.findOne({ _id: req.params.id, deleted: false, schoolId: req.user.schoolId }).lean();
     if (!old) return res.status(404).json({ error: 'Introuvable' });
     const b = clean(req.body, false); await validateRefs(c, b, req.user);
-    const d = await Model.findOneAndUpdate({ _id: req.params.id, schoolId: req.user.schoolId }, await prep(b, false, req.user), { new: true, runValidators: true }).lean();
+    const d = await Model.findOneAndUpdate({ _id: req.params.id, schoolId: req.user.schoolId }, await prep(b, false, req.user, old, {}), { new: true, runValidators: true }).lean();
     await logAudit(req.user, { action: 'update', entity: name, ref: req.params.id, avant: strip(old), apres: strip(d) });
+    if (c.afterUpdate) await c.afterUpdate(old, d, req.user);
     res.json({ ok: true });
   }));
   r.delete('/:id', auth, only(...c.write), wrap(async (req, res) => {
@@ -97,6 +103,7 @@ function crud(name, Model, c) {
     if (msg) return res.status(409).json({ error: msg });
     old.deleted = true; if (name === 'users') old.email = old.email + '#' + Date.now();
     await old.save();
+    if (c.afterDelete) await c.afterDelete(old, req.user);
     await logAudit(req.user, { action: 'delete', entity: name, ref: req.params.id });
     res.json({ ok: true });
   }));
@@ -107,15 +114,34 @@ const scopeStudents = async (u, q) => { if (u.role === 'parent') q.parent = u.id
 const scopeByStudent = async (u, q) => { const s = await myStudents(u); if (s) q.student = { $in: s.map(x => x._id) }; return q; };
 const scopeHomework = async (u, q) => { const s = await myStudents(u); if (s) q.classe = { $in: s.map(x => x.classe).filter(Boolean) }; return q; };
 const U = { path: 'parent', select: 'name' };
+// Un compte parent (ou élève) sans aucun élève inscrit est désactivé automatiquement
+async function releaseUser(id, field, role, u) {
+  if (!id) return;
+  if (await Student.exists({ schoolId: u.schoolId, [field]: id, deleted: false })) return;
+  const x = await User.findOne({ _id: id, schoolId: u.schoolId, role, deleted: false });
+  if (!x) return;
+  x.deleted = true; x.email = x.email + '#' + Date.now(); await x.save();
+  await logAudit(u, { action: 'delete', entity: 'users', ref: x.id, apres: { motif: 'compte ' + role + ' sans élève inscrit' } });
+}
 
 crud('users', User, {
   read: ['admin'], write: ['admin'], select: '-password',
-  prep: async (b, isNew) => {
-    if (b.role !== undefined && !SCHOOL_ROLES.includes(b.role)) throw new Error('Rôle non autorisé');
+  prep: async (b, isNew, u, old) => {
+    if (b.role !== undefined) {
+      if (!SCHOOL_ROLES.includes(b.role)) throw new Error('Rôle non autorisé');
+      if (isNew && LINKED.includes(b.role)) throw new Error('Un compte parent ou élève se crée depuis la fiche de l’élève (menu Élèves, bouton Ajouter)');
+      if (!isNew && old && b.role !== old.role && (LINKED.includes(b.role) || LINKED.includes(old.role))) throw new Error('Le rôle d’un compte parent ou élève ne peut pas être modifié');
+    }
     if (b.password) b.password = await bcrypt.hash(b.password, 10); else if (isNew) throw new Error('Mot de passe obligatoire'); else delete b.password;
     return b;
   },
-  canDelete: async (id, u) => id === u.id ? 'Vous ne pouvez pas supprimer votre propre compte' : null
+  canDelete: async (id, u) => {
+    if (id === u.id) return 'Vous ne pouvez pas supprimer votre propre compte';
+    const x = await User.findOne({ _id: id, schoolId: u.schoolId }).lean();
+    if (x && x.role === 'parent' && await Student.exists({ schoolId: u.schoolId, parent: id, deleted: false })) return 'Ce parent a encore des élèves inscrits : supprimez ou réaffectez ses élèves d’abord';
+    if (x && x.role === 'student' && await Student.exists({ schoolId: u.schoolId, user: id, deleted: false })) return 'Ce compte est lié à un élève : supprimez d’abord l’élève';
+    return null;
+  }
 });
 crud('classes', Classe, {
   read: ['admin', 'teacher'], write: ['admin'], populate: [{ path: 'titulaire', select: 'name' }], refs: { titulaire: User },
@@ -127,7 +153,43 @@ crud('subjects', Subject, {
 });
 crud('students', Student, {
   read: ['admin', 'teacher', 'parent', 'student', 'accountant'], write: ['admin'], scope: scopeStudents,
-  populate: ['classe', U, { path: 'user', select: 'name' }], refs: { classe: Classe, parent: User, user: User }
+  populate: ['classe', U, { path: 'user', select: 'name' }], refs: { classe: Classe, parent: User, user: User },
+  // Le parent est OBLIGATOIRE : parent existant (frère/sœur) ou nouveau compte parent créé avec l'élève
+  prep: async (b, isNew, user, old, ctx) => {
+    const sc = user.schoolId, np = b.newParent, nu = b.newUser;
+    delete b.newParent; delete b.newUser;
+    if (isNew) {
+      if (!b.nom || !b.prenom) throw new Error('Nom et prénom de l’élève obligatoires');
+      if (np && b.parent) throw new Error('Choisissez un parent existant OU créez un nouveau parent, pas les deux');
+      if (!np && !b.parent) throw new Error('Le parent est obligatoire : choisissez un parent existant ou créez un nouveau compte parent');
+      if (np && (!np.name || !np.email || !np.password)) throw new Error('Nouveau parent : nom, email et mot de passe obligatoires');
+      if (np && String(np.password).length < 6) throw new Error('Mot de passe du parent trop court (6 caractères minimum)');
+      if (nu && (!nu.email || !nu.password)) throw new Error('Compte élève : email et mot de passe obligatoires');
+      if (nu && String(nu.password).length < 6) throw new Error('Mot de passe de l’élève trop court (6 caractères minimum)');
+    } else if (b.parent === null) throw new Error('Le parent est obligatoire');
+    if (b.parent && !(await User.exists({ _id: b.parent, schoolId: sc, role: 'parent', deleted: false }))) throw new Error('Le parent choisi n’est pas un compte parent de votre école');
+    if (b.user && !(await User.exists({ _id: b.user, schoolId: sc, role: 'student', deleted: false }))) throw new Error('Le compte élève choisi est invalide');
+    const created = [];
+    ctx.rollback = async () => { for (const id of created) await User.deleteOne({ _id: id }); };
+    try {
+      if (isNew && np) {
+        const p = await User.create({ schoolId: sc, name: np.name, email: np.email, password: await bcrypt.hash(np.password, 10), role: 'parent' });
+        created.push(p._id); b.parent = p._id;
+        await logAudit(user, { action: 'create', entity: 'users', ref: p.id, apres: { role: 'parent', via: 'fiche élève' } });
+      }
+      if (isNew && nu) {
+        const su = await User.create({ schoolId: sc, name: `${b.prenom} ${b.nom}`, email: nu.email, password: await bcrypt.hash(nu.password, 10), role: 'student' });
+        created.push(su._id); b.user = su._id;
+        await logAudit(user, { action: 'create', entity: 'users', ref: su.id, apres: { role: 'student', via: 'fiche élève' } });
+      }
+    } catch (e) { await ctx.rollback(); throw e; }
+    return b;
+  },
+  afterUpdate: async (old, d, u) => {
+    if (String(old.parent || '') !== String(d.parent || '')) await releaseUser(old.parent, 'parent', 'parent', u);
+    if (old.user && String(old.user) !== String(d.user || '')) await releaseUser(old.user, 'user', 'student', u);
+  },
+  afterDelete: async (s, u) => { await releaseUser(s.parent, 'parent', 'parent', u); await releaseUser(s.user, 'user', 'student', u); }
 });
 crud('grades', Grade, { read: ['admin', 'teacher', 'parent', 'student'], write: ['admin', 'teacher'], scope: scopeByStudent, populate: ['student', 'subject'], refs: { student: Student, subject: Subject } });
 crud('payments', Payment, {
